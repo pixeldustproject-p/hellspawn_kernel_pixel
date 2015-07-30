@@ -7741,6 +7741,9 @@ static inline enum fbq_type fbq_classify_rq(struct rq *rq)
 }
 #endif /* CONFIG_NUMA_BALANCING */
 
+#define lb_sd_parent(sd) \
+	(sd->parent && sd->parent->groups != sd->parent->groups->next)
+
 /**
  * update_sd_lb_stats - Update sched_domain's statistics for load balancing.
  * @env: The load balancing environment.
@@ -7823,7 +7826,7 @@ next_group:
 
 	env->src_grp_nr_running = sds->busiest_stat.sum_nr_running;
 
-	if (!env->sd->parent) {
+	if (!lb_sd_parent(env->sd)) {
 		/* update overload indicator if we are at root domain */
 		if (env->dst_rq->rd->overload != overload)
 			env->dst_rq->rd->overload = overload;
@@ -8331,7 +8334,7 @@ static int load_balance(int this_cpu, struct rq *this_rq,
 			int *continue_balancing)
 {
 	int ld_moved, cur_ld_moved, active_balance = 0;
-	struct sched_domain *sd_parent = sd->parent;
+	struct sched_domain *sd_parent = lb_sd_parent(sd) ? sd->parent : NULL;
 	struct sched_group *group;
 	struct rq *busiest;
 	unsigned long flags;
