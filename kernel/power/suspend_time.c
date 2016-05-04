@@ -19,10 +19,10 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/seq_file.h>
-#include <linux/syscore_ops.h>
 #include <linux/time.h>
+#include <linux/suspend.h>
 
-static struct timespec suspend_time_before;
+static struct timespec before;
 static unsigned int time_in_suspend_bins[32];
 
 #ifdef CONFIG_DEBUG_FS
@@ -70,42 +70,48 @@ static int __init suspend_time_debug_init(void)
 late_initcall(suspend_time_debug_init);
 #endif
 
-static int suspend_time_syscore_suspend(void)
-{
-	read_persistent_clock(&suspend_time_before);
+/* FIXME: should be declared in include/linux/timekeeping.h */
+extern ktime_t ktime_get_update_offsets_tick(ktime_t *offs_real,
+						ktime_t *offs_boot,
+						ktime_t *offs_tai);
 
-	return 0;
-}
-
-static void suspend_time_syscore_resume(void)
+static int suspend_time_pm_event(struct notifier_block *notifier,
+				unsigned long pm_event, void *unused)
 {
 	struct timespec after;
+	ktime_t mono, real, boot, tail;
 
-	read_persistent_clock(&after);
-
-	after = timespec_sub(after, suspend_time_before);
-
-	time_in_suspend_bins[fls(after.tv_sec)]++;
-
-	pr_info("Suspended for %lu.%03lu seconds\n", after.tv_sec,
-		after.tv_nsec / NSEC_PER_MSEC);
+	switch (pm_event) {
+	case PM_SUSPEND_PREPARE:
+		mono = ktime_get_update_offsets_tick(&real, &boot, &tail);
+		before = ktime_to_timespec(boot);
+		break;
+	case PM_POST_SUSPEND:
+		mono = ktime_get_update_offsets_tick(&real, &boot, &tail);
+		after = timespec_sub(ktime_to_timespec(boot), before);
+		time_in_suspend_bins[fls(after.tv_sec)]++;
+		pr_info("Suspended for %lu.%03lu seconds\n",
+				after.tv_sec, after.tv_nsec / NSEC_PER_MSEC);
+		break;
+	default:
+		break;
+	}
+	return NOTIFY_DONE;
 }
 
-static struct syscore_ops suspend_time_syscore_ops = {
-	.suspend = suspend_time_syscore_suspend,
-	.resume = suspend_time_syscore_resume,
+static struct notifier_block suspend_time_pm_notifier_block = {
+	.notifier_call = suspend_time_pm_event,
 };
 
-static int suspend_time_syscore_init(void)
+static int suspend_time_init(void)
 {
-	register_syscore_ops(&suspend_time_syscore_ops);
-
+	register_pm_notifier(&suspend_time_pm_notifier_block);
 	return 0;
 }
 
-static void suspend_time_syscore_exit(void)
+static void suspend_time_exit(void)
 {
-	unregister_syscore_ops(&suspend_time_syscore_ops);
+	unregister_pm_notifier(&suspend_time_pm_notifier_block);
 }
-module_init(suspend_time_syscore_init);
-module_exit(suspend_time_syscore_exit);
+module_init(suspend_time_init);
+module_exit(suspend_time_exit);
