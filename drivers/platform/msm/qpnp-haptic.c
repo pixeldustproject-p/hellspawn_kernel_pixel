@@ -309,6 +309,8 @@ struct qpnp_hap {
 	struct qpnp_pwm_info pwm_info;
 	spinlock_t lock;
 	struct mutex wf_lock;
+	spinlock_t td_lock;
+	struct work_struct td_work;
 	struct completion completion;
 	enum qpnp_hap_mode play_mode;
 	enum qpnp_hap_auto_res_mode auto_res_mode;
@@ -350,6 +352,7 @@ struct qpnp_hap {
 	bool sup_brake_pat;
 	bool correct_lra_drive_freq;
 	bool misc_trim_error_rc19p2_clk_reg_present;
+	int td_value;
 };
 
 static uint32_t sc_irq_count = 0;
@@ -1779,10 +1782,19 @@ static int qpnp_hap_set(struct qpnp_hap *hap, int on)
 }
 
 /* enable interface from timed output class */
-static void qpnp_hap_td_enable(struct timed_output_dev *dev, int value)
+static void qpnp_timed_enable_worker(struct work_struct *work)
 {
-	struct qpnp_hap *hap = container_of(dev, struct qpnp_hap,
-					 timed_dev);
+	struct qpnp_hap *hap = container_of(work, struct qpnp_hap,
+                                        td_work);
+	int value;
+
+	spin_lock(&hap->td_lock);
+	value = hap->td_value;
+	spin_unlock(&hap->td_lock);
+
+	/* Vibrator already disabled */
+	if (!value && !hap->state)
+               return;
 
 	spin_lock(&hap->lock);
 
@@ -1813,12 +1825,27 @@ static void qpnp_hap_td_enable(struct timed_output_dev *dev, int value)
 		value = (value > hap->timeout_ms ?
 				 hap->timeout_ms : value);
 		hap->state = 1;
-		hrtimer_start(&hap->hap_timer,
-			      ktime_set(value / 1000, (value % 1000) * 1000000),
-			      HRTIMER_MODE_REL);
 	}
 	spin_unlock(&hap->lock);
 	schedule_work(&hap->work);
+
+	if (value)
+		hrtimer_start(&hap->hap_timer,
+			ktime_set(value / 1000, (value % 1000) * 1000000),
+			HRTIMER_MODE_REL);
+}
+
+/* enable interface from timed output class */
+static void qpnp_hap_td_enable(struct timed_output_dev *dev, int value)
+{
+	struct qpnp_hap *hap = container_of(dev, struct qpnp_hap,
+                                        timed_dev);
+
+	spin_lock(&hap->td_lock);
+	hap->td_value = value;
+	spin_unlock(&hap->td_lock);
+
+	schedule_work(&hap->td_work);
 }
 
 void set_vibrate(int value)
@@ -1937,6 +1964,10 @@ static enum hrtimer_restart qpnp_hap_timer(struct hrtimer *timer)
 {
 	struct qpnp_hap *hap = container_of(timer, struct qpnp_hap,
 							 hap_timer);
+
+	/* Vibrator already disabled */
+	if (!hap->state)
+		return HRTIMER_NORESTART;
 
 	hap->state = 0;
 	schedule_work(&hap->work);
@@ -2543,9 +2574,11 @@ static int qpnp_haptic_probe(struct spmi_device *spmi)
 
 	spin_lock_init(&hap->lock);
 	mutex_init(&hap->wf_lock);
+	spin_lock_init(&hap->td_lock);
 	INIT_WORK(&hap->work, qpnp_hap_worker);
 	INIT_DELAYED_WORK(&hap->sc_work, qpnp_handle_sc_irq);
 	init_completion(&hap->completion);
+	INIT_WORK(&hap->td_work, qpnp_timed_enable_worker);
 
 	hrtimer_init(&hap->hap_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	hap->hap_timer.function = qpnp_hap_timer;
