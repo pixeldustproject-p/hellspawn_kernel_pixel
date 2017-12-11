@@ -5510,7 +5510,6 @@ static inline int select_energy_cpu_idx(struct energy_env *eenv)
 		if (eenv->cpu[cpu_idx].nrg_delta <
 		    eenv->cpu[eenv->next_idx].nrg_delta) {
 			eenv->next_idx = cpu_idx;
-			break;
 		}
 	}
 
