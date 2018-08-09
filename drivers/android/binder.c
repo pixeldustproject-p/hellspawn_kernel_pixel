@@ -70,6 +70,7 @@
 #include <linux/pid_namespace.h>
 #include <linux/security.h>
 #include <linux/spinlock.h>
+#include <linux/syscalls.h>
 #include <linux/ratelimit.h>
 
 #include "binder.h"
@@ -644,6 +645,12 @@ struct binder_thread {
 	bool is_node_dedicated;
 };
 
+struct binder_txn_fd_fixup {
+	struct list_head fixup_entry;
+	struct file *file;
+	size_t offset;
+};
+
 struct binder_transaction {
 	int debug_id;
 	struct binder_work work;
@@ -662,6 +669,7 @@ struct binder_transaction {
 	struct binder_priority	saved_priority;
 	bool    set_priority_called;
 	kuid_t	sender_euid;
+	struct list_head fd_fixups;
 	/**
 	 * @lock:  protects @from, @to_proc, and @to_thread
 	 *
@@ -962,68 +970,6 @@ static struct binder_thread *binder_get_thread_by_pid(struct binder_proc *proc,
 struct files_struct *binder_get_files_struct(struct binder_proc *proc)
 {
 	return get_files_struct(proc->tsk);
-}
-
-static int task_get_unused_fd_flags(struct binder_proc *proc, int flags)
-{
-	struct files_struct *files;
-	unsigned long rlim_cur;
-	unsigned long irqs;
-	int ret;
-
-	files = binder_get_files_struct(proc);
-	if (files == NULL)
-		return -ESRCH;
-
-	if (!lock_task_sighand(proc->tsk, &irqs)) {
-		ret = -EMFILE;
-		goto err;
-	}
-
-	rlim_cur = task_rlimit(proc->tsk, RLIMIT_NOFILE);
-	unlock_task_sighand(proc->tsk, &irqs);
-
-	ret = __alloc_fd(files, 0, rlim_cur, flags);
-err:
-	put_files_struct(files);
-	return ret;
-}
-
-/*
- * copied from fd_install
- */
-static void task_fd_install(
-	struct binder_proc *proc, unsigned int fd, struct file *file)
-{
-	struct files_struct *files = binder_get_files_struct(proc);
-
-	if (files) {
-		__fd_install(files, fd, file);
-		put_files_struct(files);
-	}
-}
-
-/*
- * copied from sys_close
- */
-static long task_close_fd(struct binder_proc *proc, unsigned int fd)
-{
-	struct files_struct *files = binder_get_files_struct(proc);
-	int retval;
-
-	if (files == NULL)
-		return -ESRCH;
-
-	retval = __close_fd(files, fd);
-	/* can't restart close syscall because file table entry was cleared */
-	if (unlikely(retval == -ERESTARTSYS ||
-		     retval == -ERESTARTNOINTR ||
-		     retval == -ERESTARTNOHAND ||
-		     retval == -ERESTART_RESTARTBLOCK))
-		retval = -EINTR;
-	put_files_struct(files);
-
-	return retval;
 }
 
 static struct list_head *
@@ -2233,10 +2179,32 @@ static struct binder_thread *binder_get_txn_from_and_acq_inner(
 	return NULL;
 }
 
+/**
+ * binder_free_txn_fixups() - free unprocessed fd fixups
+ * @t:	binder transaction for t->from
+ *
+ * If the transaction is being torn down prior to being
+ * processed by the target process, free all of the
+ * fd fixups and fput the file structs. It is safe to
+ * call this function after the fixups have been
+ * processed -- in that case, the list will be empty.
+ */
+static void binder_free_txn_fixups(struct binder_transaction *t)
+{
+	struct binder_txn_fd_fixup *fixup, *tmp;
+
+	list_for_each_entry_safe(fixup, tmp, &t->fd_fixups, fixup_entry) {
+		fput(fixup->file);
+		list_del(&fixup->fixup_entry);
+		kfree(fixup);
+	}
+}
+
 static void binder_free_transaction(struct binder_transaction *t)
 {
 	if (t->buffer)
 		t->buffer->transaction = NULL;
+	binder_free_txn_fixups(t);
 	kfree(t);
 	binder_stats_deleted(BINDER_STAT_TRANSACTION);
 }
@@ -2544,12 +2512,17 @@ static void binder_transaction_buffer_release(struct binder_proc *proc,
 		} break;
 
 		case BINDER_TYPE_FD: {
-			struct binder_fd_object *fp = to_binder_fd_object(hdr);
-
-			binder_debug(BINDER_DEBUG_TRANSACTION,
-				     "        fd %d\n", fp->fd);
-			if (failed_at)
-				task_close_fd(proc, fp->fd);
+			/*
+			 * No need to close the file here since user-space
+			 * closes it for for successfully delivered
+			 * transactions. For transactions that weren't
+			 * delivered, the new fd was never allocated so
+			 * there is no need to close and the fput on the
+			 * file is done when the transaction is torn
+			 * down.
+			 */
+			WARN_ON(failed_at &&
+				proc->tsk == current->group_leader);
 		} break;
 		case BINDER_TYPE_PTR:
 			/*
@@ -2564,6 +2537,15 @@ static void binder_transaction_buffer_release(struct binder_proc *proc,
 			u32 *fd_array;
 			size_t fd_index;
 			binder_size_t fd_buf_size;
+
+			if (proc->tsk != current->group_leader) {
+				/*
+				 * Nothing to do if running in sender context
+				 * The fd fixups have not been applied so no
+				 * fds need to be closed.
+				 */
+				continue;
+			}
 
 			fda = to_binder_fd_array_object(hdr);
 			parent = binder_validate_ptr(buffer, fda->parent,
@@ -2597,7 +2579,7 @@ static void binder_transaction_buffer_release(struct binder_proc *proc,
 			}
 			fd_array = (u32 *)(parent_buffer + fda->parent_offset);
 			for (fd_index = 0; fd_index < fda->num_fds; fd_index++)
-				task_close_fd(proc, fd_array[fd_index]);
+				sys_close(fd_array[fd_index]);
 		} break;
 		default:
 			pr_err("transaction release %d bad object type %x\n",
@@ -2729,17 +2711,18 @@ done:
 	return ret;
 }
 
-static int binder_translate_fd(int fd,
+static int binder_translate_fd(u32 *fdp,
 			       struct binder_transaction *t,
 			       struct binder_thread *thread,
 			       struct binder_transaction *in_reply_to)
 {
 	struct binder_proc *proc = thread->proc;
 	struct binder_proc *target_proc = t->to_proc;
-	int target_fd;
+	struct binder_txn_fd_fixup *fixup;
 	struct file *file;
-	int ret;
+	int ret = 0;
 	bool target_allows_fd;
+	int fd = *fdp;
 
 	if (in_reply_to)
 		target_allows_fd = !!(in_reply_to->flags & TF_ACCEPT_FDS);
@@ -2767,19 +2750,24 @@ static int binder_translate_fd(int fd,
 		goto err_security;
 	}
 
-	target_fd = task_get_unused_fd_flags(target_proc, O_CLOEXEC);
-	if (target_fd < 0) {
+	/*
+	 * Add fixup record for this transaction. The allocation
+	 * of the fd in the target needs to be done from a
+	 * target thread.
+	 */
+	fixup = kzalloc(sizeof(*fixup), GFP_KERNEL);
+	if (!fixup) {
 		ret = -ENOMEM;
-		goto err_get_unused_fd;
+		goto err_alloc;
 	}
-	task_fd_install(target_proc, target_fd, file);
-	trace_binder_transaction_fd(t, fd, target_fd);
-	binder_debug(BINDER_DEBUG_TRANSACTION, "        fd %d -> %d\n",
-		     fd, target_fd);
+	fixup->file = file;
+	fixup->offset = (uintptr_t)fdp - (uintptr_t)t->buffer->data;
+	trace_binder_transaction_fd_send(t, fd, fixup->offset);
+	list_add_tail(&fixup->fixup_entry, &t->fd_fixups);
 
-	return target_fd;
+	return ret;
 
-err_get_unused_fd:
+err_alloc:
 err_security:
 	fput(file);
 err_fget:
@@ -2793,8 +2781,7 @@ static int binder_translate_fd_array(struct binder_fd_array_object *fda,
 				     struct binder_thread *thread,
 				     struct binder_transaction *in_reply_to)
 {
-	binder_size_t fdi, fd_buf_size, num_installed_fds;
-	int target_fd;
+	binder_size_t fdi, fd_buf_size;
 	uintptr_t parent_buffer;
 	u32 *fd_array;
 	struct binder_proc *proc = thread->proc;
@@ -2826,23 +2813,12 @@ static int binder_translate_fd_array(struct binder_fd_array_object *fda,
 		return -EINVAL;
 	}
 	for (fdi = 0; fdi < fda->num_fds; fdi++) {
-		target_fd = binder_translate_fd(fd_array[fdi], t, thread,
+		int ret = binder_translate_fd(&fd_array[fdi], t, thread,
 						in_reply_to);
-		if (target_fd < 0)
-			goto err_translate_fd_failed;
-		fd_array[fdi] = target_fd;
+		if (ret < 0)
+			return ret;
 	}
 	return 0;
-
-err_translate_fd_failed:
-	/*
-	 * Failed to allocate fd or security error, free fds
-	 * installed so far.
-	 */
-	num_installed_fds = fdi;
-	for (fdi = 0; fdi < num_installed_fds; fdi++)
-		task_close_fd(target_proc, fd_array[fdi]);
-	return target_fd;
 }
 
 static int binder_fixup_parent(struct binder_transaction *t,
@@ -3285,6 +3261,7 @@ static void binder_transaction(struct binder_proc *proc,
 		return_error_line = __LINE__;
 		goto err_alloc_t_failed;
 	}
+	INIT_LIST_HEAD(&t->fd_fixups);
 	binder_stats_created(BINDER_STAT_TRANSACTION);
 	spin_lock_init(&t->lock);
 
@@ -3448,17 +3425,16 @@ static void binder_transaction(struct binder_proc *proc,
 
 		case BINDER_TYPE_FD: {
 			struct binder_fd_object *fp = to_binder_fd_object(hdr);
-			int target_fd = binder_translate_fd(fp->fd, t, thread,
-							    in_reply_to);
+			int ret = binder_translate_fd(&fp->fd, t, thread,
+						      in_reply_to);
 
-			if (target_fd < 0) {
+			if (ret < 0) {
 				return_error = BR_FAILED_REPLY;
-				return_error_param = target_fd;
+				return_error_param = ret;
 				return_error_line = __LINE__;
 				goto err_translate_failed;
 			}
 			fp->pad_binder = 0;
-			fp->fd = target_fd;
 		} break;
 		case BINDER_TYPE_FDA: {
 			struct binder_fd_array_object *fda =
@@ -3616,6 +3592,7 @@ err_bad_object_type:
 err_bad_offset:
 err_bad_parent:
 err_copy_data_failed:
+	binder_free_txn_fixups(t);
 	trace_binder_transaction_failed_buffer_release(t->buffer);
 	binder_transaction_buffer_release(target_proc, t->buffer, offp);
 	if (target_node)
@@ -4224,6 +4201,76 @@ static int binder_wait_for_work(struct binder_thread *thread,
 	return ret;
 }
 
+/**
+ * binder_apply_fd_fixups() - finish fd translation
+ * @t:	binder transaction for t->from
+ *
+ * Now that we are in the context of the transaction target
+ * process, we can allocate and install fds. Process the
+ * list of fds to translate and fixup the buffer with the
+ * new fds.
+ *
+ * If we fail to allocate an fd, then free the resources by
+ * fput'ing files that have not been processed and sys_close'ing
+ * any fds that have already been allocated.
+ */
+static int binder_apply_fd_fixups(struct binder_transaction *t)
+{
+	struct binder_txn_fd_fixup *fixup, *tmp;
+	int ret = 0;
+
+	list_for_each_entry(fixup, &t->fd_fixups, fixup_entry) {
+		int fd = get_unused_fd_flags(O_CLOEXEC);
+		u32 *fdp;
+
+		if (fd < 0) {
+			binder_debug(BINDER_DEBUG_TRANSACTION,
+				     "failed fd fixup txn %d fd %d\n",
+				     t->debug_id, fd);
+			ret = -ENOMEM;
+			break;
+		}
+		binder_debug(BINDER_DEBUG_TRANSACTION,
+			     "fd fixup txn %d fd %d\n",
+			     t->debug_id, fd);
+		trace_binder_transaction_fd_recv(t, fd, fixup->offset);
+		fd_install(fd, fixup->file);
+		fixup->file = NULL;
+		fdp = (u32 *)(t->buffer->data + fixup->offset);
+		/*
+		 * This store can cause problems for CPUs with a
+		 * VIVT cache (eg ARMv5) since the cache cannot
+		 * detect virtual aliases to the same physical cacheline.
+		 * To support VIVT, this address and the user-space VA
+		 * would both need to be flushed. Since this kernel
+		 * VA is not constructed via page_to_virt(), we can't
+		 * use flush_dcache_page() on it, so we'd have to use
+		 * an internal function. If devices with VIVT ever
+		 * need to run Android, we'll either need to go back
+		 * to patching the translated fd from the sender side
+		 * (using the non-standard kernel functions), or rework
+		 * how the kernel uses the buffer to use page_to_virt()
+		 * addresses instead of allocating in our own vm area.
+		 *
+		 * For now, we disable compilation if CONFIG_CPU_CACHE_VIVT.
+		 */
+		*fdp = fd;
+	}
+	list_for_each_entry_safe(fixup, tmp, &t->fd_fixups, fixup_entry) {
+		if (fixup->file) {
+			fput(fixup->file);
+		} else if (ret) {
+			u32 *fdp = (u32 *)(t->buffer->data + fixup->offset);
+
+			sys_close(*fdp);
+		}
+		list_del(&fixup->fixup_entry);
+		kfree(fixup);
+	}
+
+	return ret;
+}
+
 static int binder_thread_read(struct binder_proc *proc,
 			      struct binder_thread *thread,
 			      binder_uintptr_t binder_buffer, size_t size,
@@ -4506,6 +4553,15 @@ retry:
 			tr.sender_pid = 0;
 		}
 
+		ret = binder_apply_fd_fixups(t);
+		if (ret) {
+			if (t_from)
+				binder_thread_dec_tmpref(t_from);
+
+			binder_cleanup_transaction(t, "fd fixups failed",
+						   BR_FAILED_REPLY);
+			return ret;
+		}
 		tr.data_size = t->buffer->data_size;
 		tr.offsets_size = t->buffer->offsets_size;
 		tr.data.ptr.buffer = (binder_uintptr_t)
@@ -5233,8 +5289,9 @@ static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
 	vma->vm_private_data = proc;
 
 	ret = binder_alloc_mmap_handler(&proc->alloc, vma);
-
-	return ret;
+	if (ret)
+		return ret;
+	return 0;
 
 err_bad_arg:
 	pr_err("%s: %d %lx-%lx %s failed %d\n", __func__,
